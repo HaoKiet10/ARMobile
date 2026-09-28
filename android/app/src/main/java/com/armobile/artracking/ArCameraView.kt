@@ -224,7 +224,10 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
             backgroundRenderer.updateTexCoords(frame)
             backgroundRenderer.draw()
 
-            val updatedImages = frame.getUpdatedTrackables(AugmentedImage::class.java)
+            // Quét TẤT CẢ augmented image mỗi frame thay vì chỉ getUpdatedTrackables:
+            // ảnh chuyển LAST_KNOWN_POSE -> FULL_TRACKING khi quay lại có thể không nằm
+            // trong danh sách "updated", làm mất tracking sau lần đầu.
+            val updatedImages = s.getAllTrackables(AugmentedImage::class.java)
             for (img in updatedImages) {
                 val stateStr = "${img.name} ${img.trackingState}/${img.trackingMethod}"
                 if (stateStr != lastImgState) {
