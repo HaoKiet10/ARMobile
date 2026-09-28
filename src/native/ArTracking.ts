@@ -12,10 +12,10 @@ export interface ArAnchorUpdatedEvent {
 }
 
 interface ArCameraViewProps extends ViewProps {
-  /** Tên file ảnh target, đặt trong android/app/src/main/assets/ */
-  targetAssetName: string;
+  /** URL công khai của trigger image (project.triggerImageUrl từ backend) */
+  targetImageUrl: string;
   targetName?: string;
-  /** Chiều rộng thật của marker in ra, đơn vị mét */
+  /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét — khớp NOMINAL_MARKER_WIDTH cũ */
   physicalWidth?: number;
   overlayBoxSize?: number;
 }

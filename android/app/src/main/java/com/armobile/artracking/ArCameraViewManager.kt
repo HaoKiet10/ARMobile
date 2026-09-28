@@ -62,9 +62,12 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
         return view
     }
 
-    @ReactProp(name = "targetAssetName")
-    fun setTargetAssetName(view: ArCameraView, name: String?) {
-        view.targetAssetName = name
+    // Đổi tên từ targetAssetName (VBTest) -> targetImageUrl: trigger image của main
+    // project là URL động từ backend (project.triggerImageUrl), không phải asset
+    // bundle sẵn trong app như bản test.
+    @ReactProp(name = "targetImageUrl")
+    fun setTargetImageUrl(view: ArCameraView, url: String?) {
+        view.targetImageUrl = url
     }
 
     @ReactProp(name = "targetName")

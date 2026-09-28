@@ -1,6 +1,7 @@
 package com.armobile.artracking
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -21,6 +22,8 @@ import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
+import java.net.HttpURLConnection
+import java.net.URL
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -37,16 +40,18 @@ interface ArTrackingListener {
 private const val TAG = "ArCameraView"
 
 /**
- * View camera AR thuần, không qua react-viro. Làm 3 việc:
- * 1. Vẽ camera feed lên màn hình (BackgroundRenderer)
- * 2. Track augmented image, bắn pose (position + quaternion) ra ngoài qua listener
- * 3. Vẽ 1 khối cube màu đè lên marker theo đúng pose (CubeRenderer) — proof-of-concept
- *    cho overlay 3D, trước khi thay bằng model thật (glTF) qua Filament/SceneView.
+ * View camera AR thuần (port từ VBTest), không qua react-viro. Khác VBTest ở chỗ
+ * ảnh trigger KHÔNG bundle sẵn trong assets — mà tải động theo `targetImageUrl`
+ * (project.triggerImageUrl từ backend, khác nhau theo từng project). Việc tải
+ * ảnh chạy đồng bộ trên GL thread lúc setup session — CHẤP NHẬN ĐƯỢC cho MVP vì
+ * GL thread không phải main thread, nhưng nên chuyển sang async + loading state
+ * ở bước polish sau (TODO).
  */
 class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceView(context, attrs) {
 
     var listener: ArTrackingListener? = null
-    var targetAssetName: String? = null
+    /** URL công khai của trigger image (http/https), hoặc file://, hoặc tên asset cục bộ (fallback debug) */
+    var targetImageUrl: String? = null
     var targetName: String = "target"
     var physicalWidthMeters: Float = 0.15f
 
@@ -56,7 +61,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     private var trackingActive = false
     private var surfaceReady = false
     private var latestPose: Pose? = null
-    /** Kích thước cube overlay, mét — đổi số này để thấy rõ box to/nhỏ khi test */
+    /** Kích thước cube overlay placeholder — sẽ thay bằng model thật (Filament) sau khi validate flow xong */
     var overlayBoxSizeMeters: Float = 0.05f
 
     init {
@@ -88,6 +93,32 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     private var installRequested = false
 
+    /** Tải bitmap trigger image: http(s) URL, file:// local path, hoặc fallback tên asset bundle */
+    private fun loadTargetBitmap(source: String): Bitmap? {
+        return try {
+            when {
+                source.startsWith("http://") || source.startsWith("https://") -> {
+                    val conn = URL(source).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 15000
+                    conn.doInput = true
+                    conn.connect()
+                    conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                }
+                source.startsWith("file://") -> {
+                    BitmapFactory.decodeFile(source.removePrefix("file://"))
+                }
+                else -> {
+                    // fallback: coi như tên file trong android/app/src/main/assets (debug/test)
+                    context.assets.open(source).use { BitmapFactory.decodeStream(it) }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Không tải được target image từ '$source'", e)
+            null
+        }
+    }
+
     @Synchronized
     private fun setupSessionIfNeeded() {
         if (session != null) return
@@ -109,16 +140,14 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
             val config = Config(s).apply {
                 focusMode = Config.FocusMode.AUTO
                 val db = AugmentedImageDatabase(s)
-                targetAssetName?.let { assetName ->
-                    context.assets.open(assetName).use { input ->
-                        val bmp = BitmapFactory.decodeStream(input)
-                        if (bmp == null) {
-                            Log.e(TAG, "Không decode được asset '$assetName' — file hỏng hoặc sai định dạng")
-                        } else {
-                            Log.i(TAG, "Decoded '$assetName': ${bmp.width}x${bmp.height}px, physicalWidth=$physicalWidthMeters m")
-                            val index = db.addImage(targetName, bmp, physicalWidthMeters)
-                            Log.i(TAG, "Đã add '$targetName' vào AugmentedImageDatabase, index=$index")
-                        }
+                targetImageUrl?.let { source ->
+                    val bmp = loadTargetBitmap(source)
+                    if (bmp == null) {
+                        Log.e(TAG, "Không decode được target image '$source' — bỏ qua augmented image tracking")
+                    } else {
+                        Log.i(TAG, "Decoded trigger image: ${bmp.width}x${bmp.height}px, physicalWidth=$physicalWidthMeters m")
+                        val index = db.addImage(targetName, bmp, physicalWidthMeters)
+                        Log.i(TAG, "Đã add '$targetName' vào AugmentedImageDatabase, index=$index")
                     }
                 }
                 augmentedImageDatabase = db
@@ -174,8 +203,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
                     }
                     else -> {
                         // TrackingState.PAUSED/STOPPED, hoặc TRACKING nhưng chỉ bằng
-                        // extended tracking (LAST_KNOWN_POSE — đang đoán bằng IMU,
-                        // không còn thấy marker thật) -> coi như đã mất track.
+                        // extended tracking (LAST_KNOWN_POSE) -> coi như đã mất track.
                         if (trackingActive) {
                             trackingActive = false
                             latestPose = null
@@ -185,7 +213,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
                 }
             }
 
-            // Vẽ overlay cube đè lên marker theo pose mới nhất — nếu đang tracking
+            // Placeholder overlay (cube đỏ) — sẽ thay bằng Filament render layer thật sau.
             val pose = latestPose
             if (trackingActive && pose != null) {
                 val viewMatrix = FloatArray(16)

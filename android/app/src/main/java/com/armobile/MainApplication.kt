@@ -15,7 +15,8 @@ class MainApplication : Application(), ReactApplication {
       context = applicationContext,
       packageList =
         PackageList(this).packages.apply {
-          // Packages that cannot be autolinked yet can be added manually here.
+          // react-viro đã bị gỡ -> thay bằng native module tự viết (ArTrackingPackage),
+          // cũng không hỗ trợ autolinking nên vẫn phải add thủ công ở đây.
           add(ArTrackingPackage())
         },
     )
