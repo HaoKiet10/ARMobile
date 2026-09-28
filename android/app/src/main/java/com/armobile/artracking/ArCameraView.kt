@@ -3,6 +3,8 @@ package com.armobile.artracking
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
@@ -17,6 +19,7 @@ import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
+import com.google.ar.core.exceptions.ImageInsufficientQualityException
 import com.google.ar.core.exceptions.UnavailableApkTooOldException
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
@@ -52,6 +55,13 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     var listener: ArTrackingListener? = null
     /** URL công khai của trigger image (http/https), hoặc file://, hoặc tên asset cục bộ (fallback debug) */
     var targetImageUrl: String? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            targetBitmap = null
+            startTargetLoad(value)
+        }
+    @Volatile private var targetBitmap: Bitmap? = null
     var targetName: String = "target"
     var physicalWidthMeters: Float = 0.15f
 
@@ -61,6 +71,10 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     private var trackingActive = false
     private var surfaceReady = false
     private var latestPose: Pose? = null
+    @Volatile private var hostResumed = false
+    private var viewWidth = 0
+    private var viewHeight = 0
+    private var lastImgState: String? = null
     /** Kích thước cube overlay placeholder — sẽ thay bằng model thật (Filament) sau khi validate flow xong */
     var overlayBoxSizeMeters: Float = 0.05f
 
@@ -77,6 +91,8 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
             override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
                 GLES20.glViewport(0, 0, width, height)
+                viewWidth = width
+                viewHeight = height
                 session?.setDisplayGeometry(getDisplayRotation(), width, height)
             }
 
@@ -119,9 +135,30 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         }
     }
 
+    /**
+     * Tải ảnh trigger ở thread nền (main thread cấm network -> NetworkOnMainThreadException),
+     * xong thì đẩy việc dựng session sang GL thread.
+     */
+    private fun startTargetLoad(source: String?) {
+        if (source == null) return
+        Thread {
+            val bmp = loadTargetBitmap(source)
+            if (bmp == null) {
+                Log.e(TAG, "Không decode được target image '$source' — không dựng được session")
+                return@Thread
+            }
+            if (targetImageUrl != source) return@Thread // prop đã đổi trong lúc tải
+            targetBitmap = bmp
+            queueEvent { setupSessionIfNeeded() }
+        }.start()
+    }
+
     @Synchronized
     private fun setupSessionIfNeeded() {
         if (session != null) return
+        // Chưa có ảnh trigger (đang tải hoặc chưa set prop) -> chưa dựng session,
+        // dựng sớm sẽ ra database rỗng và không bao giờ track được.
+        val bmp = targetBitmap ?: return
         try {
             val activity = context as? android.app.Activity
             if (activity != null) {
@@ -140,21 +177,27 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
             val config = Config(s).apply {
                 focusMode = Config.FocusMode.AUTO
                 val db = AugmentedImageDatabase(s)
-                targetImageUrl?.let { source ->
-                    val bmp = loadTargetBitmap(source)
-                    if (bmp == null) {
-                        Log.e(TAG, "Không decode được target image '$source' — bỏ qua augmented image tracking")
-                    } else {
-                        Log.i(TAG, "Decoded trigger image: ${bmp.width}x${bmp.height}px, physicalWidth=$physicalWidthMeters m")
-                        val index = db.addImage(targetName, bmp, physicalWidthMeters)
-                        Log.i(TAG, "Đã add '$targetName' vào AugmentedImageDatabase, index=$index")
-                    }
+                Log.i(TAG, "Decoded trigger image: ${bmp.width}x${bmp.height}px, hasAlpha=${bmp.hasAlpha()}, physicalWidth=$physicalWidthMeters m")
+                // Ảnh có alpha (PNG trong suốt) làm ARCore mất feature -> đè lên nền trắng, ép ARGB_8888
+                val flat = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+                Canvas(flat).apply { drawColor(Color.WHITE); drawBitmap(bmp, 0f, 0f, null) }
+                try {
+                    val index = db.addImage(targetName, flat, physicalWidthMeters)
+                    Log.i(TAG, "Đã add '$targetName' vào AugmentedImageDatabase, index=$index, numImages=${db.numImages}")
+                } catch (e: ImageInsufficientQualityException) {
+                    Log.e(TAG, "ARCore TỪ CHỐI trigger image: chất lượng feature quá thấp (ít chi tiết/tương phản, quá mịn/đơn sắc). Đổi ảnh khác.", e)
                 }
                 augmentedImageDatabase = db
             }
             s.configure(config)
             s.setCameraTextureName(backgroundRenderer.textureId)
+            // Session giờ dựng muộn (sau khi ảnh tải xong), có thể SAU onSurfaceChanged
+            // -> phải set display geometry ở đây, không thì hình camera/pose bị sai hướng.
+            if (viewWidth > 0 && viewHeight > 0) s.setDisplayGeometry(getDisplayRotation(), viewWidth, viewHeight)
             session = s
+            if (hostResumed) {
+                try { s.resume() } catch (e: Exception) { Log.e(TAG, "resume after setup failed", e) }
+            }
         } catch (e: UnavailableArcoreNotInstalledException) {
             Log.e(TAG, "ARCore chưa được cài trên máy này", e)
         } catch (e: UnavailableUserDeclinedInstallationException) {
@@ -183,6 +226,11 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
             val updatedImages = frame.getUpdatedTrackables(AugmentedImage::class.java)
             for (img in updatedImages) {
+                val stateStr = "${img.name} ${img.trackingState}/${img.trackingMethod}"
+                if (stateStr != lastImgState) {
+                    lastImgState = stateStr
+                    Log.i(TAG, "AugmentedImage: $stateStr")
+                }
                 val isReallyTracking =
                     img.trackingState == TrackingState.TRACKING &&
                         img.trackingMethod == AugmentedImage.TrackingMethod.FULL_TRACKING
@@ -240,6 +288,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     }
 
     fun onHostResume() {
+        hostResumed = true
         setupSessionIfNeeded()
         try {
             session?.resume()
@@ -250,6 +299,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     }
 
     fun onHostPause() {
+        hostResumed = false
         onPause()
         session?.pause()
     }
