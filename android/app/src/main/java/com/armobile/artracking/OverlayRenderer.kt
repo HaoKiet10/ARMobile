@@ -60,7 +60,7 @@ fun parseOverlaySpecs(json: String?): List<OverlaySpec> {
 /**
  * Vẽ ảnh + video lên marker bằng quad có texture (GLES2), dùng chung GL context với ArCameraView.
  * Video dùng MediaPlayer -> SurfaceTexture -> external OES texture (không cần thêm dependency).
- * Chỉ hỗ trợ image/video; model 3D (glb) làm ở bước sau.
+ * Hỗ trợ image, video và model 3D .glb (GlbRenderer).
  */
 class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
 
@@ -75,6 +75,7 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
         var surfaceTexture: SurfaceTexture? = null
         var surface: Surface? = null
         @Volatile var player: MediaPlayer? = null
+        @Volatile var model: GlbGpuModel? = null
         val frameAvailable = AtomicBoolean(false)
         val texMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
     }
@@ -91,6 +92,7 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
     @Volatile private var active = false
     private var flatProg: Prog? = null
     private var oesProg: Prog? = null
+    private val glb = GlbRenderer()
 
     // Quad đơn vị 1x1, tâm gốc, nằm trong mặt XY. (0,0)=góc dưới-trái của ảnh.
     private val quad: FloatBuffer = directBuffer(floatArrayOf(-0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f))
@@ -131,6 +133,7 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
     fun createOnGlThread() {
         flatProg = Prog(buildProgram(VS, FS_2D))
         oesProg = Prog(buildProgram(VS, FS_OES))
+        glb.createOnGlThread()
     }
 
     private fun buildProgram(vs: String, fs: String): Int {
@@ -159,6 +162,7 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
             when (spec.kind) {
                 "image" -> startImage(Item(spec).also { items.add(it) })
                 "video" -> startVideo(Item(spec).also { items.add(it) })
+                "model" -> startModel(Item(spec).also { items.add(it) })
                 else -> Log.w(TAG, "Bỏ qua asset '${spec.id}' kind=${spec.kind} (chưa hỗ trợ)")
             }
         }
@@ -211,6 +215,51 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
                 item.ready = true
                 b.recycle()
                 Log.i(TAG, "Ảnh '${item.spec.id}' sẵn sàng (${item.aspect})")
+            })
+        }.start()
+    }
+
+    // ---------------- Model 3D (.glb) ----------------
+
+    private fun loadBytes(source: String): ByteArray? = try {
+        if (source.startsWith("http://") || source.startsWith("https://")) {
+            val conn = URL(source).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 60000
+            conn.connect()
+            conn.inputStream.use { it.readBytes() }
+        } else {
+            java.io.File(source.removePrefix("file://")).readBytes()
+        }
+    } catch (e: Throwable) {
+        Log.e(TAG, "Không tải được model '$source'", e)
+        null
+    }
+
+    private fun startModel(item: Item) {
+        Thread {
+            val bytes = loadBytes(item.spec.url)
+            if (bytes == null || item.released) return@Thread
+            val data = try {
+                GlbParser.parse(bytes)
+            } catch (e: Throwable) {
+                Log.e(TAG, "Không đọc được model '${item.spec.url}'", e)
+                return@Thread
+            }
+            data.warnings.forEach { Log.w(TAG, "Model '${item.spec.id}': $it") }
+            if (data.primitives.isEmpty()) return@Thread
+            data.bounds()?.let {
+                Log.i(TAG, "Model '${item.spec.id}': ${data.primitives.size} mesh, kích thước gốc " +
+                    "%.3f x %.3f x %.3f (đơn vị file)".format(it[3] - it[0], it[4] - it[1], it[5] - it[2]))
+            }
+            val bitmaps = data.textures.map { t -> t.image?.let { GlbRenderer.decodeTexture(it) } }
+            if (item.released) return@Thread
+            requestGl(Runnable {
+                if (item.released) { bitmaps.forEach { it?.recycle() }; return@Runnable }
+                item.model = glb.upload(data, bitmaps)
+                item.hasFrame = true
+                item.ready = true
+                Log.i(TAG, "Model '${item.spec.id}' sẵn sàng")
             })
         }.start()
     }
@@ -298,6 +347,10 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
         item.player = null
         item.surface?.release()
         item.surfaceTexture?.release()
+        if (deleteGl) {
+            item.model?.release()
+            item.model = null
+        }
         if (deleteGl && item.textureId != 0) GLES20.glDeleteTextures(1, intArrayOf(item.textureId), 0)
     }
 
@@ -326,18 +379,30 @@ class OverlayRenderer(private val requestGl: (Runnable) -> Unit) {
             }
             if (!item.hasFrame) continue
 
-            val prog = (if (item.external) oesProg else flatProg) ?: continue
-            val target = if (item.external) GLES11Ext.GL_TEXTURE_EXTERNAL_OES else GLES20.GL_TEXTURE_2D
-
-            // model = pose * T(position) * Rz*Ry*Rx(-90 để nằm phẳng trên marker) * S
-            // Quad nằm mặt XY; xoay -90° quanh X cho pháp tuyến hướng +Y (ra khỏi mặt marker),
-            // cạnh trên của ảnh trùng cạnh trên marker (đúng quy ước ViroImage cũ).
+            // Editor của designer: marker là mặt phẳng XY (x phải, y lên, z ra khỏi mặt phẳng), quad
+            // mặc định quay mặt về +Z. ARCore: marker nằm trong mặt XZ (x phải, y ra khỏi mặt, z xuống dưới).
+            // C = xoay -90° quanh X đổi hệ editor -> hệ marker: (x, y, z) -> (x, z, -y).
+            // model = pose * T(position đã đổi hệ ở JS) * C * R_editor * S
+            // A-Frame áp rotation theo Euler 'YXZ' (aframe/src/components/rotation.js) -> R = Ry * Rx * Rz,
+            // tức gọi rotate theo thứ tự y, x, z.
             val model = poseM.copyOf()
             val s = item.spec
             Matrix.translateM(model, 0, s.position[0], s.position[1], s.position[2])
-            Matrix.rotateM(model, 0, s.rotationDeg[2], 0f, 0f, 1f)
+            Matrix.rotateM(model, 0, -90f, 1f, 0f, 0f)
             Matrix.rotateM(model, 0, s.rotationDeg[1], 0f, 1f, 0f)
-            Matrix.rotateM(model, 0, s.rotationDeg[0] - 90f, 1f, 0f, 0f)
+            Matrix.rotateM(model, 0, s.rotationDeg[0], 1f, 0f, 0f)
+            Matrix.rotateM(model, 0, s.rotationDeg[2], 0f, 0f, 1f)
+
+            if (s.kind == "model") {
+                // scale (x, y, z) = tỉ lệ editor × marker width, áp lên kích thước gốc của file (đơn vị mét theo glTF)
+                val glbModel = item.model ?: continue
+                Matrix.scaleM(model, 0, s.scale[0], s.scale[1], s.scale[2])
+                glb.draw(glbModel, model, vp)
+                continue
+            }
+
+            val prog = (if (item.external) oesProg else flatProg) ?: continue
+            val target = if (item.external) GLES11Ext.GL_TEXTURE_EXTERNAL_OES else GLES20.GL_TEXTURE_2D
             Matrix.scaleM(model, 0, s.scale[0], s.scale[1] / item.aspect, s.scale[2])
             val mvp = FloatArray(16)
             Matrix.multiplyMM(mvp, 0, vp, 0, model, 0)
