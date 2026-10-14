@@ -62,12 +62,20 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
             startTargetLoad(value)
         }
     @Volatile private var targetBitmap: Bitmap? = null
+    /** JSON mảng asset overlay (image/video) — xem OverlaySpec. JS đã quy đổi position/scale sang mét. */
+    var assetsJson: String? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            overlay.setAssets(parseOverlaySpecs(value))
+        }
     var targetName: String = "target"
     var physicalWidthMeters: Float = 0.15f
 
     private var session: Session? = null
     private val backgroundRenderer = BackgroundRenderer()
     private val cubeRenderer = CubeRenderer()
+    private val overlay = OverlayRenderer { queueEvent(it) }
     private var trackingActive = false
     private var surfaceReady = false
     private var latestPose: Pose? = null
@@ -85,6 +93,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
             override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
                 backgroundRenderer.createOnGlThread()
                 cubeRenderer.createOnGlThread()
+                overlay.createOnGlThread()
                 surfaceReady = true
                 setupSessionIfNeeded()
             }
@@ -243,6 +252,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
                         if (!trackingActive) {
                             trackingActive = true
                             listener?.onAnchorFound(targetName)
+                            overlay.setActive(true)
                         }
                         val pose = img.centerPose
                         latestPose = pose
@@ -259,6 +269,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
                             trackingActive = false
                             latestPose = null
                             listener?.onAnchorRemoved(targetName)
+                            overlay.setActive(false)
                         }
                     }
                 }
@@ -281,7 +292,8 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
                 val mvpMatrix = FloatArray(16)
                 Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
 
-                cubeRenderer.draw(mvpMatrix)
+                // Có asset overlay thì vẽ asset, không có thì giữ cube đỏ debug
+                if (overlay.hasItems()) overlay.draw(viewMatrix, projMatrix, pose) else cubeRenderer.draw(mvpMatrix)
             }
         } catch (e: CameraNotAvailableException) {
             Log.e(TAG, "Camera not available", e)
@@ -292,6 +304,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     fun onHostResume() {
         hostResumed = true
+        overlay.resumeIfActive()
         setupSessionIfNeeded()
         try {
             session?.resume()
@@ -303,11 +316,13 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     fun onHostPause() {
         hostResumed = false
+        overlay.pauseAll()
         onPause()
         session?.pause()
     }
 
     fun onHostDestroy() {
+        overlay.releaseAll()
         session?.close()
         session = null
     }

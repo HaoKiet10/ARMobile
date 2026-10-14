@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
@@ -15,6 +15,7 @@ import {
 } from '../native/ArTracking';
 import { fetchPublicProject } from '../services/api';
 import { PublicProject } from '../types/ar';
+import { buildOverlayAssetsJson } from '../utils/arAssets';
 
 // Khớp NOMINAL_MARKER_WIDTH cũ trong ARSceneContent.tsx (react-viro) — chiều rộng
 // "danh nghĩa" ARCore dùng để ước lượng pose, KHÔNG phải kích thước thật tuyệt đối
@@ -84,6 +85,11 @@ const ARScanScreen: React.FC<Props> = ({ projectId, onBack }) => {
     };
   }, []);
 
+  const assetsJson = useMemo(
+    () => (project ? buildOverlayAssetsJson(project.assets, NOMINAL_MARKER_WIDTH) : undefined),
+    [project],
+  );
+
   if (loadState === 'loading') {
     return (
       <View style={styles.centerContainer}>
@@ -129,6 +135,7 @@ const ARScanScreen: React.FC<Props> = ({ projectId, onBack }) => {
         targetName="active_project_trigger"
         physicalWidth={NOMINAL_MARKER_WIDTH}
         overlayBoxSize={0.05}
+        assetsJson={assetsJson}
       />
 
       {!isFound && (

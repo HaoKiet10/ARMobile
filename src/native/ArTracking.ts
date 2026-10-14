@@ -15,6 +15,8 @@ interface ArCameraViewProps extends ViewProps {
   /** URL công khai của trigger image (project.triggerImageUrl từ backend) */
   targetImageUrl: string;
   targetName?: string;
+  /** JSON string mảng asset overlay ảnh/video, tạo bởi buildOverlayAssetsJson() */
+  assetsJson?: string;
   /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét — khớp NOMINAL_MARKER_WIDTH cũ */
   physicalWidth?: number;
   overlayBoxSize?: number;

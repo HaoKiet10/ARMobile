@@ -70,6 +70,11 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
         view.targetImageUrl = url
     }
 
+    @ReactProp(name = "assetsJson")
+    fun setAssetsJson(view: ArCameraView, json: String?) {
+        view.assetsJson = json
+    }
+
     @ReactProp(name = "targetName")
     fun setTargetName(view: ArCameraView, name: String?) {
         view.targetName = name ?: "target"
