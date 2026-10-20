@@ -27,9 +27,6 @@ interface ArCameraViewProps extends ViewProps {
   reloadToken?: number;
   /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét */
   physicalWidth?: number;
-  overlayBoxSize?: number;
-  /** Debug: vẽ cube đỏ tại marker đang track khi chưa có overlay */
-  showDebugCube?: boolean;
   /** Debug: bắn event pose mỗi frame (nặng bridge) */
   emitPose?: boolean;
 }

@@ -7,7 +7,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.opengl.Matrix
 import android.util.AttributeSet
 import android.util.Log
 import com.google.ar.core.ArCoreApk
@@ -71,9 +70,6 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     var listener: ArTrackingListener? = null
     var physicalWidthMeters: Float = 0.15f
-    /** Chỉ bật khi debug: cube đỏ tại mỗi marker đang track nếu chưa có overlay */
-    var showDebugCube: Boolean = false
-    var overlayBoxSizeMeters: Float = 0.05f
     /** Bắn event pose mỗi frame qua bridge — chỉ bật khi cần debug (60 event/giây/marker) */
     var emitPose: Boolean = false
     /** Gọi khi view bị gỡ (manager dùng để bỏ lifecycle listener) */
@@ -105,7 +101,6 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     @Volatile private var session: Session? = null
     private val backgroundRenderer = BackgroundRenderer()
-    private val cubeRenderer = CubeRenderer()
     private val overlay = OverlayRenderer { queueEvent(it) }
     @Volatile private var activeTarget: String? = null
     @Volatile private var loadGeneration = 0
@@ -130,7 +125,6 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         setRenderer(object : Renderer {
             override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
                 backgroundRenderer.createOnGlThread()
-                cubeRenderer.createOnGlThread()
                 overlay.createOnGlThread()
                 surfaceReady = true
             }
@@ -480,34 +474,18 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
             val target = activeTarget
             val activePose = if (target != null) poses[target] else null
-            val drawOverlay = activePose != null && overlay.hasItems()
-            if (drawOverlay || (showDebugCube && poses.isNotEmpty())) {
+            if (activePose != null && overlay.hasItems()) {
                 val viewMatrix = FloatArray(16)
                 val projMatrix = FloatArray(16)
                 frame.camera.getViewMatrix(viewMatrix, 0)
                 frame.camera.getProjectionMatrix(projMatrix, 0, 0.05f, 100f)
-                if (drawOverlay && activePose != null) {
-                    overlay.draw(viewMatrix, projMatrix, activePose)
-                } else if (showDebugCube) {
-                    for (p in poses.values) drawDebugCube(p, viewMatrix, projMatrix)
-                }
+                overlay.draw(viewMatrix, projMatrix, activePose)
             }
         } catch (e: CameraNotAvailableException) {
             Log.e(TAG, "Camera not available", e)
         } catch (e: Exception) {
             Log.e(TAG, "update() failed", e)
         }
-    }
-
-    private fun drawDebugCube(pose: Pose, view: FloatArray, proj: FloatArray) {
-        val modelMatrix = FloatArray(16)
-        pose.toMatrix(modelMatrix, 0)
-        Matrix.scaleM(modelMatrix, 0, overlayBoxSizeMeters, overlayBoxSizeMeters, overlayBoxSizeMeters)
-        val vp = FloatArray(16)
-        Matrix.multiplyMM(vp, 0, proj, 0, view, 0)
-        val mvp = FloatArray(16)
-        Matrix.multiplyMM(mvp, 0, vp, 0, modelMatrix, 0)
-        cubeRenderer.draw(mvp)
     }
 
     // ---------------------------------------------------------------- lifecycle

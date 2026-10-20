@@ -99,16 +99,6 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
         view.physicalWidthMeters = width
     }
 
-    @ReactProp(name = "overlayBoxSize", defaultFloat = 0.05f)
-    fun setOverlayBoxSize(view: ArCameraView, size: Float) {
-        view.overlayBoxSizeMeters = size
-    }
-
-    @ReactProp(name = "showDebugCube", defaultBoolean = false)
-    fun setShowDebugCube(view: ArCameraView, show: Boolean) {
-        view.showDebugCube = show
-    }
-
     @ReactProp(name = "emitPose", defaultBoolean = false)
     fun setEmitPose(view: ArCameraView, emit: Boolean) {
         view.emitPose = emit
