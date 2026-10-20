@@ -56,3 +56,11 @@ export function buildOverlayAssetsJson(assets: ARAsset[], markerWidth: number): 
     }));
   return JSON.stringify(list);
 }
+
+/**
+ * Giá trị cho prop overlayJson: gắn danh sách asset với TARGET (tên ảnh trigger = projectId) trong
+ * MỘT prop duy nhất, để native không bao giờ vẽ asset của project này tại pose của project khác.
+ */
+export function buildOverlayConfigJson(target: string, assets: ARAsset[], markerWidth: number): string {
+  return JSON.stringify({ target, assets: JSON.parse(buildOverlayAssetsJson(assets, markerWidth)) });
+} 

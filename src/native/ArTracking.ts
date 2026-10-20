@@ -11,15 +11,27 @@ export interface ArAnchorUpdatedEvent {
   qw: number;
 }
 
+export type ArStatusState = 'loading' | 'ready' | 'error';
+
+export interface ArStatusEvent {
+  state: ArStatusState;
+  message?: string;
+}
+
 interface ArCameraViewProps extends ViewProps {
-  /** URL công khai của trigger image (project.triggerImageUrl từ backend) */
-  targetImageUrl: string;
-  targetName?: string;
-  /** JSON string mảng asset overlay ảnh/video, tạo bởi buildOverlayAssetsJson() */
-  assetsJson?: string;
-  /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét — khớp NOMINAL_MARKER_WIDTH cũ */
+  /** JSON string mảng [{ name: projectId, url: triggerImageUrl }] — tất cả ảnh cần nhận diện */
+  targetsJson?: string;
+  /** JSON string { target: projectId, assets: [...] } — overlay của project đang active (buildOverlayConfigJson) */
+  overlayJson?: string;
+  /** Đổi số này để native dựng lại database + session (nút "Thử lại") */
+  reloadToken?: number;
+  /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét */
   physicalWidth?: number;
   overlayBoxSize?: number;
+  /** Debug: vẽ cube đỏ tại marker đang track khi chưa có overlay */
+  showDebugCube?: boolean;
+  /** Debug: bắn event pose mỗi frame (nặng bridge) */
+  emitPose?: boolean;
 }
 
 export const ArCameraView = requireNativeComponent<ArCameraViewProps>('ArCameraView');
@@ -34,4 +46,8 @@ export function addAnchorUpdatedListener(cb: (e: ArAnchorUpdatedEvent) => void):
 
 export function addAnchorRemovedListener(cb: (e: { name: string }) => void): EmitterSubscription {
   return DeviceEventEmitter.addListener('ArAnchorRemoved', cb);
+}
+
+export function addStatusListener(cb: (e: ArStatusEvent) => void): EmitterSubscription {
+  return DeviceEventEmitter.addListener('ArStatus', cb);
 }

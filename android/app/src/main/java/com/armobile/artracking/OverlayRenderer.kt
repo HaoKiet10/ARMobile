@@ -57,6 +57,21 @@ fun parseOverlaySpecs(json: String?): List<OverlaySpec> {
     }
 }
 
+/** Cấu hình overlay của 1 target: {"target": "<tên ảnh trigger>", "assets": [...]} */
+class OverlayConfig(val target: String?, val specs: List<OverlaySpec>)
+
+fun parseOverlayConfig(json: String?): OverlayConfig {
+    if (json.isNullOrBlank()) return OverlayConfig(null, emptyList())
+    return try {
+        val o = JSONObject(json)
+        val target = o.optString("target").ifEmpty { null }
+        OverlayConfig(target, parseOverlaySpecs(o.optJSONArray("assets")?.toString()))
+    } catch (e: Exception) {
+        Log.e(TAG, "overlayJson không hợp lệ", e)
+        OverlayConfig(null, emptyList())
+    }
+}
+
 /**
  * Vẽ ảnh + video lên marker bằng quad có texture (GLES2), dùng chung GL context với ArCameraView.
  * Video dùng MediaPlayer -> SurfaceTexture -> external OES texture (không cần thêm dependency).

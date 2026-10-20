@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -10,65 +10,53 @@ import {
 } from 'react-native';
 import {
   ArCameraView,
+  ArStatusEvent,
   addAnchorFoundListener,
   addAnchorRemovedListener,
+  addStatusListener,
 } from '../native/ArTracking';
-import { fetchPublicProject } from '../services/api';
-import { PublicProject } from '../types/ar';
-import { buildOverlayAssetsJson } from '../utils/arAssets';
+import { fetchPublicProject, fetchPublishedTriggers } from '../services/api';
+import { PublicProject, PublishedTrigger } from '../types/ar';
+import { buildOverlayConfigJson } from '../utils/arAssets';
 
-// Khớp NOMINAL_MARKER_WIDTH cũ trong ARSceneContent.tsx (react-viro) — chiều rộng
-// "danh nghĩa" ARCore dùng để ước lượng pose, KHÔNG phải kích thước thật tuyệt đối
-// của từng trigger image. Giữ nguyên 0.15 để không đổi hành vi tracking đã test ổn ở VBTest.
+// Chiều rộng "danh nghĩa" (mét) của ảnh trigger — ARCore dùng để ước lượng pose; cũng là hệ số quy đổi
+// toạ độ editor (1 đơn vị = 100% bề rộng ảnh trigger) sang mét. Giữ khớp với editor/README.
 const NOMINAL_MARKER_WIDTH = 0.15;
 
-type LoadState = 'loading' | 'ready' | 'error';
+type ListPhase = 'loading' | 'error' | 'empty' | 'ready';
 
-interface Props {
-  projectId: string;
-  onBack?: () => void;
+interface ActiveProject {
+  id: string;
+  project: PublicProject;
 }
 
-const ARScanScreen: React.FC<Props> = ({ projectId, onBack }) => {
-  const [project, setProject] = useState<PublicProject | null>(null);
-  const [loadState, setLoadState] = useState<LoadState>('loading');
-  const [errorMsg, setErrorMsg] = useState<string>('');
-  const [isFound, setIsFound] = useState(false);
+/**
+ * Màn hình quét tự động: không cần nhập Project ID. App tải danh sách trigger image của mọi project đã
+ * publish, ARCore nhận diện ảnh nào thì tải project đó và hiện nội dung lên.
+ */
+const ARScanScreen: React.FC = () => {
   const [hasCameraPermission, setHasCameraPermission] = useState(false);
+  const [phase, setPhase] = useState<ListPhase>('loading');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [triggers, setTriggers] = useState<PublishedTrigger[]>([]);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [arStatus, setArStatus] = useState<ArStatusEvent>({ state: 'loading' });
+  const [active, setActive] = useState<ActiveProject | null>(null);
+  const [trackedIds, setTrackedIds] = useState<string[]>([]);
+  const [contentError, setContentError] = useState<string | null>(null);
 
-  const loadProject = async () => {
-    setLoadState('loading');
-    try {
-      const data = await fetchPublicProject(projectId);
-      if (!data.triggerImageUrl) {
-        throw new Error('Project chưa có trigger image');
-      }
-      setProject(data);
-      setLoadState('ready');
-    } catch (err: any) {
-      setErrorMsg(err?.message ?? 'Không tải được project');
-      setLoadState('error');
-    }
-  };
+  const trackedRef = useRef<Set<string>>(new Set());
+  const activeIdRef = useRef<string | null>(null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    loadProject();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
-
-  // react-viro trước đây tự xin quyền camera nội bộ. Native module tự viết
-  // KHÔNG làm việc này -> phải xin thủ công trước khi mount ArCameraView.
   useEffect(() => {
     (async () => {
       if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.CAMERA,
-          {
-            title: 'Cần quyền Camera',
-            message: 'App cần camera để nhận diện trigger image',
-            buttonPositive: 'Đồng ý',
-          },
-        );
+        const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+          title: 'Cần quyền Camera',
+          message: 'App cần camera để nhận diện ảnh trigger',
+          buttonPositive: 'Đồng ý',
+        });
         setHasCameraPermission(granted === PermissionsAndroid.RESULTS.GRANTED);
       } else {
         setHasCameraPermission(true);
@@ -76,80 +64,178 @@ const ARScanScreen: React.FC<Props> = ({ projectId, onBack }) => {
     })();
   }, []);
 
+  const loadList = useCallback(async () => {
+    setPhase('loading');
+    setActive(null);
+    setContentError(null);
+    activeIdRef.current = null;
+    trackedRef.current.clear();
+    setTrackedIds([]);
+    setArStatus({ state: 'loading' });
+    try {
+      const list = await fetchPublishedTriggers();
+      const valid = list.filter((t) => !!t.triggerImageUrl);
+      setTriggers(valid);
+      setPhase(valid.length > 0 ? 'ready' : 'empty');
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Không tải được danh sách project');
+      setPhase('error');
+    }
+  }, []);
+
   useEffect(() => {
-    const s1 = addAnchorFoundListener(() => setIsFound(true));
-    const s2 = addAnchorRemovedListener(() => setIsFound(false));
+    loadList();
+  }, [loadList]);
+
+  const activate = useCallback(async (id: string) => {
+    activeIdRef.current = id;
+    setContentError(null);
+    try {
+      const project = await fetchPublicProject(id);
+      if (activeIdRef.current !== id) return; // đã chuyển sang project khác trong lúc tải
+      setActive({ id, project });
+    } catch (err: any) {
+      if (activeIdRef.current !== id) return;
+      activeIdRef.current = null;
+      setContentError(err?.message ?? 'Không tải được nội dung');
+      // Thử lại 1 lần sau 2.5s nếu ảnh vẫn đang được nhìn thấy
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+      retryTimer.current = setTimeout(() => {
+        if (trackedRef.current.has(id) && !activeIdRef.current) activate(id);
+      }, 2500);
+    }
+  }, []);
+
+  useEffect(() => {
+    const syncTracked = () => setTrackedIds(Array.from(trackedRef.current));
+
+    const s1 = addAnchorFoundListener(({ name }) => {
+      const cur = activeIdRef.current;
+      const curTracked = cur != null && trackedRef.current.has(cur);
+      trackedRef.current.add(name);
+      syncTracked();
+      // Đang có project active mà vẫn nhìn thấy nó -> giữ nguyên, tránh nhấp nháy khi 2 ảnh cùng vào khung
+      if (!curTracked && cur !== name) activate(name);
+    });
+    const s2 = addAnchorRemovedListener(({ name }) => {
+      trackedRef.current.delete(name);
+      syncTracked();
+      if (activeIdRef.current === name) {
+        const other = trackedRef.current.values().next().value;
+        if (other) activate(other);
+        // Không có ảnh nào khác: giữ project active (nội dung đã tải) để nhìn lại là hiện ngay
+      }
+    });
+    const s3 = addStatusListener(setArStatus);
     return () => {
       s1.remove();
       s2.remove();
+      s3.remove();
+      if (retryTimer.current) clearTimeout(retryTimer.current);
     };
-  }, []);
+  }, [activate]);
 
-  const assetsJson = useMemo(
-    () => (project ? buildOverlayAssetsJson(project.assets, NOMINAL_MARKER_WIDTH) : undefined),
-    [project],
+  const targetsJson = useMemo(
+    () => JSON.stringify(triggers.map((t) => ({ name: t.id, url: t.triggerImageUrl }))),
+    [triggers],
   );
 
-  if (loadState === 'loading') {
-    return (
-      <View style={styles.centerContainer}>
-        <ActivityIndicator size="large" color="#ffffff" />
-        <Text style={styles.loadingText}>Đang tải project...</Text>
-      </View>
-    );
-  }
+  const overlayJson = useMemo(
+    () => (active ? buildOverlayConfigJson(active.id, active.project.assets, NOMINAL_MARKER_WIDTH) : undefined),
+    [active],
+  );
 
-  if (loadState === 'error' || !project) {
-    return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.errorText}>{errorMsg}</Text>
-        <TouchableOpacity style={styles.retryButton} onPress={loadProject}>
-          <Text style={styles.retryButtonText}>Thử lại</Text>
-        </TouchableOpacity>
-        {onBack && (
-          <TouchableOpacity style={styles.backButton} onPress={onBack}>
-            <Text style={styles.backButtonText}>Quay lại</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-    );
-  }
+  const retryAll = () => {
+    setReloadToken((t) => t + 1);
+    loadList();
+  };
 
   if (!hasCameraPermission) {
     return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.loadingText}>Đang chờ quyền camera...</Text>
+      <View style={styles.center}>
+        <Text style={styles.text}>Đang chờ quyền camera...</Text>
       </View>
     );
   }
 
+  if (phase === 'loading') {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#ffffff" />
+        <Text style={styles.text}>Đang tải danh sách project...</Text>
+      </View>
+    );
+  }
+
+  if (phase === 'error') {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.errorText}>{errorMsg}</Text>
+        <TouchableOpacity style={styles.button} onPress={retryAll}>
+          <Text style={styles.buttonText}>Thử lại</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (phase === 'empty') {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.errorText}>Chưa có project nào được publish.</Text>
+        <TouchableOpacity style={styles.button} onPress={retryAll}>
+          <Text style={styles.buttonText}>Tải lại</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const activeTracked = !!active && trackedIds.includes(active.id);
+  const anyTracked = trackedIds.length > 0;
+
   return (
     <View style={styles.flex}>
-      {/* TODO (bước polish sau khi validate flow xong): thay overlay cube placeholder
-          trong native module bằng render layer Filament thật, dùng project.assets +
-          transform (position/rotation/scale) — logic quy đổi relativeToAR() cũ trong
-          ARSceneContent.tsx vẫn còn giá trị tham khảo, chưa xoá. */}
       <ArCameraView
         style={styles.flex}
-        targetImageUrl={project.triggerImageUrl!}
-        targetName="active_project_trigger"
+        targetsJson={targetsJson}
+        overlayJson={overlayJson}
+        reloadToken={reloadToken}
         physicalWidth={NOMINAL_MARKER_WIDTH}
-        overlayBoxSize={0.05}
-        assetsJson={assetsJson}
       />
 
-      {!isFound && (
+      {arStatus.state === 'ready' && !anyTracked && (
         <View style={styles.overlay} pointerEvents="none">
           <View style={styles.scanFrame} />
-          <Text style={styles.overlayText}>
-            Đưa camera vào ảnh trigger của "{project.name}"
+          <Text style={styles.overlayText}>Đưa camera vào ảnh trigger để bắt đầu</Text>
+        </View>
+      )}
+
+      {arStatus.state === 'ready' && anyTracked && (
+        <View style={styles.badge} pointerEvents="none">
+          <Text style={styles.badgeText}>
+            {activeTracked ? `Đã nhận diện: ${active!.project.name}` : 'Đang tải nội dung...'}
           </Text>
         </View>
       )}
 
-      {isFound && (
-        <View style={styles.foundBadge} pointerEvents="none">
-          <Text style={styles.foundBadgeText}>Đã nhận diện: {project.name}</Text>
+      {contentError && anyTracked && (
+        <View style={[styles.badge, styles.badgeError]} pointerEvents="none">
+          <Text style={styles.badgeText}>{contentError}</Text>
+        </View>
+      )}
+
+      {arStatus.state === 'loading' && (
+        <View style={styles.cover}>
+          <ActivityIndicator size="large" color="#ffffff" />
+          <Text style={styles.text}>{arStatus.message ?? 'Đang chuẩn bị nhận diện...'}</Text>
+        </View>
+      )}
+
+      {arStatus.state === 'error' && (
+        <View style={styles.cover}>
+          <Text style={styles.errorText}>{arStatus.message ?? 'Không khởi tạo được AR'}</Text>
+          <TouchableOpacity style={styles.button} onPress={retryAll}>
+            <Text style={styles.buttonText}>Thử lại</Text>
+          </TouchableOpacity>
         </View>
       )}
     </View>
@@ -158,30 +244,22 @@ const ARScanScreen: React.FC<Props> = ({ projectId, onBack }) => {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  centerContainer: {
-    flex: 1,
-    backgroundColor: '#000',
+  center: { flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  cover: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.75)',
     alignItems: 'center',
     justifyContent: 'center',
     padding: 24,
   },
-  loadingText: { color: '#fff', marginTop: 12, fontSize: 16 },
-  errorText: {
-    color: '#fff',
-    fontSize: 16,
-    textAlign: 'center',
-    marginBottom: 16,
-  },
-  retryButton: {
-    backgroundColor: '#2f6fed',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 8,
-    marginBottom: 12,
-  },
-  retryButtonText: { color: '#fff', fontWeight: '600' },
-  backButton: { paddingVertical: 8 },
-  backButtonText: { color: '#aaa' },
+  text: { color: '#fff', marginTop: 12, fontSize: 16, textAlign: 'center' },
+  errorText: { color: '#fff', fontSize: 16, textAlign: 'center', marginBottom: 16 },
+  button: { backgroundColor: '#2f6fed', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
+  buttonText: { color: '#fff', fontWeight: '600' },
   overlay: {
     position: 'absolute',
     top: 0,
@@ -209,7 +287,7 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     maxWidth: 280,
   },
-  foundBadge: {
+  badge: {
     position: 'absolute',
     top: 60,
     alignSelf: 'center',
@@ -218,7 +296,8 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 20,
   },
-  foundBadgeText: { color: '#fff', fontWeight: '600' },
+  badgeError: { top: 110, backgroundColor: 'rgba(200,60,60,0.9)' },
+  badgeText: { color: '#fff', fontWeight: '600' },
 });
 
 export default ARScanScreen;

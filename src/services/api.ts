@@ -1,4 +1,4 @@
-import { PublicProject } from '../types/ar';
+import { PublicProject, PublishedTrigger } from '../types/ar';
 
 // TODO: đổi thành URL backend thật (staging/production)
 const API_BASE_URL = 'https://ar-backend-vkdz.onrender.com';
@@ -14,6 +14,17 @@ export async function fetchPublicProject(projectId: string): Promise<PublicProje
       throw new Error('Project không tồn tại hoặc chưa được publish');
     }
     throw new Error(`Fetch project failed: ${res.status}`);
+  }
+  return res.json();
+}
+/**
+ * Danh sách trigger image của mọi project đã publish — dùng để dựng database nhận diện, app tự nhận ra
+ * project khi người dùng soi vào ảnh. Map backend: GET /public/projects (scan.controller.ts).
+ */
+export async function fetchPublishedTriggers(): Promise<PublishedTrigger[]> {
+  const res = await fetch(`${API_BASE_URL}/public/projects`);
+  if (!res.ok) {
+    throw new Error(`Fetch danh sách project failed: ${res.status}`);
   }
   return res.json();
 }

@@ -26,3 +26,9 @@ export interface PublicProject {
   triggerImageUrl: string | null;
   assets: ARAsset[];
 }
+// Khớp response của GET /public/projects (scan.controller.ts -> listPublishedTriggers)
+export interface PublishedTrigger {
+  id: string;
+  name: string;
+  triggerImageUrl: string | null;
+}

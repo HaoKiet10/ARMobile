@@ -51,33 +51,47 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
             override fun onAnchorRemoved(name: String) {
                 emit("ArAnchorRemoved", Arguments.createMap().apply { putString("name", name) })
             }
+
+            override fun onStatus(state: String, message: String?) {
+                emit("ArStatus", Arguments.createMap().apply {
+                    putString("state", state)
+                    if (message != null) putString("message", message)
+                })
+            }
         }
 
-        reactContext.addLifecycleEventListener(object : LifecycleEventListener {
+        val lifecycle = object : LifecycleEventListener {
             override fun onHostResume() = view.onHostResume()
             override fun onHostPause() = view.onHostPause()
             override fun onHostDestroy() = view.onHostDestroy()
-        })
+        }
+        reactContext.addLifecycleEventListener(lifecycle)
+        // Gỡ listener khi React unmount view (trước đây listener rò rỉ và session không bao giờ được đóng)
+        view.onDispose = { reactContext.removeLifecycleEventListener(lifecycle) }
 
         return view
     }
 
-    // Đổi tên từ targetAssetName (VBTest) -> targetImageUrl: trigger image của main
-    // project là URL động từ backend (project.triggerImageUrl), không phải asset
-    // bundle sẵn trong app như bản test.
-    @ReactProp(name = "targetImageUrl")
-    fun setTargetImageUrl(view: ArCameraView, url: String?) {
-        view.targetImageUrl = url
+    override fun onDropViewInstance(view: ArCameraView) {
+        super.onDropViewInstance(view)
+        view.dispose()
     }
 
-    @ReactProp(name = "assetsJson")
-    fun setAssetsJson(view: ArCameraView, json: String?) {
-        view.assetsJson = json
+    /** JSON mảng [{"name": "<projectId>", "url": "<triggerImageUrl>"}] — danh sách ảnh để nhận diện */
+    @ReactProp(name = "targetsJson")
+    fun setTargetsJson(view: ArCameraView, json: String?) {
+        view.targetsJson = json
     }
 
-    @ReactProp(name = "targetName")
-    fun setTargetName(view: ArCameraView, name: String?) {
-        view.targetName = name ?: "target"
+    /** {"target": "<projectId>", "assets": [...]} — overlay của project đang active */
+    @ReactProp(name = "overlayJson")
+    fun setOverlayJson(view: ArCameraView, json: String?) {
+        view.overlayJson = json
+    }
+
+    @ReactProp(name = "reloadToken", defaultInt = 0)
+    fun setReloadToken(view: ArCameraView, token: Int) {
+        view.reloadToken = token
     }
 
     @ReactProp(name = "physicalWidth", defaultFloat = 0.15f)
@@ -88,5 +102,15 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
     @ReactProp(name = "overlayBoxSize", defaultFloat = 0.05f)
     fun setOverlayBoxSize(view: ArCameraView, size: Float) {
         view.overlayBoxSizeMeters = size
+    }
+
+    @ReactProp(name = "showDebugCube", defaultBoolean = false)
+    fun setShowDebugCube(view: ArCameraView, show: Boolean) {
+        view.showDebugCube = show
+    }
+
+    @ReactProp(name = "emitPose", defaultBoolean = false)
+    fun setEmitPose(view: ArCameraView, emit: Boolean) {
+        view.emitPose = emit
     }
 }
