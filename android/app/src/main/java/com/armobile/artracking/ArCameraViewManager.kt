@@ -77,10 +77,10 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
         view.dispose()
     }
 
-    /** JSON mảng [{"name": "<projectId>", "url": "<triggerImageUrl>"}] — danh sách ảnh để nhận diện */
-    @ReactProp(name = "targetsJson")
-    fun setTargetsJson(view: ArCameraView, json: String?) {
-        view.targetsJson = json
+    /** JSON {"version", "url", "sha256"} — database nhận diện dựng sẵn trên server (GET /public/trigger-db) */
+    @ReactProp(name = "triggerDbJson")
+    fun setTriggerDbJson(view: ArCameraView, json: String?) {
+        view.triggerDbJson = json
     }
 
     /** {"target": "<projectId>", "assets": [...]} — overlay của project đang active */
@@ -92,11 +92,6 @@ class ArCameraViewManager : SimpleViewManager<ArCameraView>() {
     @ReactProp(name = "reloadToken", defaultInt = 0)
     fun setReloadToken(view: ArCameraView, token: Int) {
         view.reloadToken = token
-    }
-
-    @ReactProp(name = "physicalWidth", defaultFloat = 0.15f)
-    fun setPhysicalWidth(view: ArCameraView, width: Float) {
-        view.physicalWidthMeters = width
     }
 
     @ReactProp(name = "emitPose", defaultBoolean = false)

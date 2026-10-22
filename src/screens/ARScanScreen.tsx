@@ -15,12 +15,13 @@ import {
   addAnchorRemovedListener,
   addStatusListener,
 } from '../native/ArTracking';
-import { fetchPublicProject, fetchPublishedTriggers } from '../services/api';
-import { PublicProject, PublishedTrigger } from '../types/ar';
+import { fetchPublicProject, fetchTriggerDb } from '../services/api';
+import { PublicProject, TriggerDb } from '../types/ar';
 import { buildOverlayConfigJson } from '../utils/arAssets';
 
-// Chiều rộng "danh nghĩa" (mét) của ảnh trigger — ARCore dùng để ước lượng pose; cũng là hệ số quy đổi
-// toạ độ editor (1 đơn vị = 100% bề rộng ảnh trigger) sang mét. Giữ khớp với editor/README.
+// Chiều rộng "danh nghĩa" (mét) của ảnh trigger — hệ số quy đổi toạ độ editor (1 đơn vị = 100% bề rộng ảnh
+// trigger) sang mét. PHẢI khớp NOMINAL_MARKER_WIDTH_M của backend (trigger-db.service.ts): server ghi đúng
+// chiều rộng này vào database nhận diện để ARCore ước lượng pose. Giữ khớp với editor/README.
 const NOMINAL_MARKER_WIDTH = 0.15;
 
 type ListPhase = 'loading' | 'error' | 'empty' | 'ready';
@@ -38,7 +39,7 @@ const ARScanScreen: React.FC = () => {
   const [hasCameraPermission, setHasCameraPermission] = useState(false);
   const [phase, setPhase] = useState<ListPhase>('loading');
   const [errorMsg, setErrorMsg] = useState('');
-  const [triggers, setTriggers] = useState<PublishedTrigger[]>([]);
+  const [triggerDb, setTriggerDb] = useState<TriggerDb | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [arStatus, setArStatus] = useState<ArStatusEvent>({ state: 'loading' });
   const [active, setActive] = useState<ActiveProject | null>(null);
@@ -73,10 +74,9 @@ const ARScanScreen: React.FC = () => {
     setTrackedIds([]);
     setArStatus({ state: 'loading' });
     try {
-      const list = await fetchPublishedTriggers();
-      const valid = list.filter((t) => !!t.triggerImageUrl);
-      setTriggers(valid);
-      setPhase(valid.length > 0 ? 'ready' : 'empty');
+      const db = await fetchTriggerDb();
+      setTriggerDb(db);
+      setPhase(db.url && db.triggers.length > 0 ? 'ready' : 'empty');
     } catch (err: any) {
       setErrorMsg(err?.message ?? 'Không tải được danh sách project');
       setPhase('error');
@@ -135,9 +135,12 @@ const ARScanScreen: React.FC = () => {
     };
   }, [activate]);
 
-  const targetsJson = useMemo(
-    () => JSON.stringify(triggers.map((t) => ({ name: t.id, url: t.triggerImageUrl }))),
-    [triggers],
+  const triggerDbJson = useMemo(
+    () =>
+      triggerDb?.url
+        ? JSON.stringify({ version: triggerDb.version, url: triggerDb.url, sha256: triggerDb.sha256 })
+        : undefined,
+    [triggerDb],
   );
 
   const overlayJson = useMemo(
@@ -196,10 +199,9 @@ const ARScanScreen: React.FC = () => {
     <View style={styles.flex}>
       <ArCameraView
         style={styles.flex}
-        targetsJson={targetsJson}
+        triggerDbJson={triggerDbJson}
         overlayJson={overlayJson}
         reloadToken={reloadToken}
-        physicalWidth={NOMINAL_MARKER_WIDTH}
       />
 
       {arStatus.state === 'ready' && !anyTracked && (

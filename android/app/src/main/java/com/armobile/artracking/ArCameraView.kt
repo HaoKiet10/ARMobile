@@ -1,10 +1,6 @@
 package com.armobile.artracking
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.util.AttributeSet
@@ -18,21 +14,19 @@ import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
-import com.google.ar.core.exceptions.ImageInsufficientQualityException
 import com.google.ar.core.exceptions.UnavailableApkTooOldException
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
-import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
-import java.util.concurrent.Callable
-import java.util.concurrent.Executors
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -50,18 +44,13 @@ interface ArTrackingListener {
 
 private const val TAG = "ArCameraView"
 
-/** Trần số ảnh của 1 AugmentedImageDatabase (ARCore) */
-private const val MAX_DB_IMAGES = 1000
-
-/** Ảnh trigger được thu nhỏ về tối đa cỡ này trước khi addImage (nhanh hơn, ARCore vẫn đủ chi tiết) */
-private const val MAX_TARGET_DIM = 1024
-
-class TargetSpec(val name: String, val url: String)
+/** Database nhận diện dựng sẵn trên server (GET /public/trigger-db) */
+class TriggerDbSpec(val version: String, val url: String, val sha256: String)
 
 /**
  * View camera AR thuần, không qua react-viro. Tự nhận diện NHIỀU ảnh trigger cùng lúc:
- *  - `targetsJson`: danh sách [{name, url}] (name = projectId) -> dựng 1 AugmentedImageDatabase.
- *    Database được serialize ra cache nên lần mở app sau chỉ deserialize (nhanh), không addImage lại.
+ *  - `triggerDbJson`: {version, url, sha256} — database .imgdb do server dựng sẵn (name = projectId).
+ *    Tải 1 lần, kiểm tra sha256 rồi mới lưu cache; lần mở app sau chỉ deserialize, không tải lại.
  *  - Mỗi ảnh có trạng thái tracking riêng; báo found/removed theo `name`.
  *  - `overlayJson`: {"target": name, "assets": [...]} — overlay của project đang "active", chỉ vẽ khi
  *    ảnh của target đó đang được track thật (FULL_TRACKING).
@@ -69,14 +58,13 @@ class TargetSpec(val name: String, val url: String)
 class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceView(context, attrs) {
 
     var listener: ArTrackingListener? = null
-    var physicalWidthMeters: Float = 0.15f
     /** Bắn event pose mỗi frame qua bridge — chỉ bật khi cần debug (60 event/giây/marker) */
     var emitPose: Boolean = false
     /** Gọi khi view bị gỡ (manager dùng để bỏ lifecycle listener) */
     var onDispose: (() -> Unit)? = null
 
-    /** JSON mảng [{"name": "...", "url": "..."}] */
-    var targetsJson: String? = null
+    /** JSON {"version": "...", "url": "...", "sha256": "..."} từ GET /public/trigger-db */
+    var triggerDbJson: String? = null
         set(value) {
             if (field == value) return
             field = value
@@ -88,7 +76,7 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         set(value) {
             if (field == value) return
             field = value
-            restartTargets(targetsJson)
+            restartTargets(triggerDbJson)
         }
 
     /** {"target": "<name>", "assets": [...]} — xem parseOverlayConfig */
@@ -161,19 +149,15 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
     // ---------------------------------------------------------------- dựng database + session
 
-    private fun parseTargets(json: String?): List<TargetSpec> {
-        if (json.isNullOrBlank()) return emptyList()
+    private fun parseTriggerDb(json: String?): TriggerDbSpec? {
+        if (json.isNullOrBlank()) return null
         return try {
-            val arr = JSONArray(json)
-            (0 until arr.length()).mapNotNull { i ->
-                val o = arr.getJSONObject(i)
-                val name = o.optString("name")
-                val url = o.optString("url")
-                if (name.isEmpty() || url.isEmpty()) null else TargetSpec(name, url)
-            }
+            val o = JSONObject(json)
+            val spec = TriggerDbSpec(o.optString("version"), o.optString("url"), o.optString("sha256"))
+            if (spec.url.isEmpty() || spec.sha256.isEmpty()) null else spec
         } catch (e: Exception) {
-            Log.e(TAG, "targetsJson không hợp lệ", e)
-            emptyList()
+            Log.e(TAG, "triggerDbJson không hợp lệ", e)
+            null
         }
     }
 
@@ -183,12 +167,12 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         Log.i(TAG, "restartTargets view=${System.identityHashCode(this)} gen=$gen")
         queueEvent { releaseSession() }
         if (json == null) return
-        val targets = parseTargets(json)
-        if (targets.isEmpty()) {
-            listener?.onStatus("error", "Không có ảnh trigger nào để nhận diện")
+        val spec = parseTriggerDb(json)
+        if (spec == null) {
+            listener?.onStatus("error", "Không có database nhận diện để tải")
             return
         }
-        Thread { prepareTargets(gen, targets) }.start()
+        Thread { prepareTargets(gen, spec, retried = false) }.start()
     }
 
     /** GL thread */
@@ -203,29 +187,26 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
     }
 
     /**
-     * Thread nền: CHỈ tải ảnh (khi chưa có cache database). Việc tạo Session + dựng database chạy ở GL thread,
-     * nơi ARCore đã hoạt động ổn từ trước — tạo Session ở thread nền thuần làm ARCore ném FatalException.
+     * Thread nền: CHỈ tải file database (khi chưa có trong cache). Việc tạo Session + nạp database chạy ở GL
+     * thread, nơi ARCore đã hoạt động ổn từ trước — tạo Session ở thread nền thuần làm ARCore ném FatalException.
      */
-    private fun prepareTargets(gen: Int, all: List<TargetSpec>) {
+    private fun prepareTargets(gen: Int, spec: TriggerDbSpec, retried: Boolean) {
         try {
-            val targets = if (all.size > MAX_DB_IMAGES) {
-                Log.w(TAG, "Có ${all.size} ảnh trigger, ARCore chỉ nạp tối đa $MAX_DB_IMAGES — bỏ phần dư")
-                all.take(MAX_DB_IMAGES)
-            } else all
-            listener?.onStatus("loading", "Đang chuẩn bị ${targets.size} ảnh nhận diện…")
-
-            val cacheFile = cacheFileFor(targets)
-            val hasCache = cacheFile.exists() && cacheFile.length() > 0
-            val images = if (hasCache) null else downloadAll(targets, gen)
+            val cacheFile = cacheFileFor(spec)
+            // File cache chỉ xuất hiện sau khi đã tải đủ và khớp sha256 (xem downloadDatabase)
+            if (!cacheFile.exists()) {
+                listener?.onStatus("loading", "Đang tải database nhận diện…")
+                downloadDatabase(spec, cacheFile)
+            }
             if (gen != loadGeneration) return
-            queueEvent { createSessionOnGl(gen, targets, cacheFile, images) }
+            queueEvent { createSessionOnGl(gen, spec, cacheFile, retried) }
         } catch (e: Throwable) {
-            fail("Không tải được ảnh nhận diện: ${describe(e)}", e)
+            fail("Không tải được database nhận diện: ${describe(e)}", e)
         }
     }
 
-    /** GL thread. images == null nghĩa là dùng database đã cache. */
-    private fun createSessionOnGl(gen: Int, targets: List<TargetSpec>, cacheFile: File, images: List<Pair<String, Bitmap>>?) {
+    /** GL thread */
+    private fun createSessionOnGl(gen: Int, spec: TriggerDbSpec, cacheFile: File, retried: Boolean) {
         if (gen != loadGeneration) return
         var s: Session? = null
         try {
@@ -246,16 +227,16 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
 
             // Chỉ cho phép 1 Session được tạo tại một thời điểm trong toàn process
             s = synchronized(SESSION_LOCK) { Session(context) }
-            val db = if (images == null) loadCachedDatabase(s, cacheFile) else buildDatabase(s, targets, cacheFile, images, gen)
+            val db = loadCachedDatabase(s, cacheFile)
             if (gen != loadGeneration) return
-            if (db == null) {
-                if (images == null) {
-                    // Cache hỏng -> xoá, chạy lại từ đầu (lần này sẽ tải ảnh và dựng mới)
-                    Log.w(TAG, "Cache imgdb hỏng, dựng lại từ đầu")
-                    cacheFile.delete()
-                    restartTargets(targetsJson)
+            if (db == null || db.numImages == 0) {
+                cacheFile.delete()
+                if (db == null && !retried) {
+                    // Cache không đọc được -> xoá, tải lại đúng 1 lần (không lặp vô hạn nếu file trên server hỏng)
+                    Log.w(TAG, "Cache imgdb không đọc được, tải lại")
+                    Thread { prepareTargets(gen, spec, retried = true) }.start()
                 } else {
-                    fail("Không có ảnh trigger nào dùng được (tải lỗi hoặc ảnh chất lượng thấp)", null)
+                    fail(if (db == null) "Database nhận diện không đọc được" else "Database nhận diện không có ảnh nào", null)
                 }
                 return
             }
@@ -309,12 +290,10 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         listener?.onStatus("ready", null)
     }
 
-    private fun cacheFileFor(targets: List<TargetSpec>): File {
-        val md = MessageDigest.getInstance("SHA-1")
-        md.update("w=$physicalWidthMeters\n".toByteArray())
-        for (t in targets.sortedBy { it.name }) md.update("${t.name}|${t.url}\n".toByteArray())
-        val key = md.digest().joinToString("") { "%02x".format(it) }
-        return File(context.cacheDir, "armobile_aug_$key.imgdb")
+    /** Tên file theo sha256 nội dung: file khác nội dung không bao giờ trùng tên */
+    private fun cacheFileFor(spec: TriggerDbSpec): File {
+        val key = spec.sha256.lowercase().filter { it in '0'..'9' || it in 'a'..'f' }.take(32)
+        return File(context.cacheDir, "armobile_trigger_$key.imgdb")
     }
 
     private fun loadCachedDatabase(s: Session, cacheFile: File): AugmentedImageDatabase? {
@@ -330,96 +309,48 @@ class ArCameraView(context: Context, attrs: AttributeSet? = null) : GLSurfaceVie
         }
     }
 
-    private fun buildDatabase(
-        s: Session, targets: List<TargetSpec>, cacheFile: File,
-        images: List<Pair<String, Bitmap>>, gen: Int,
-    ): AugmentedImageDatabase? {
-        val db = AugmentedImageDatabase(s)
-        var added = 0
-        for ((i, pair) in images.withIndex()) {
-            if (gen != loadGeneration) return null
-            val (name, bmp) = pair
+    /**
+     * Tải về file tạm, kiểm tra HTTP 200 + sha256 rồi mới đổi tên thành [dest] — file trong cache luôn là
+     * bản đầy đủ, đúng như server dựng. Tải lỗi/cụt/hỏng thì ném lỗi, không để lại gì.
+     */
+    private fun downloadDatabase(spec: TriggerDbSpec, dest: File) {
+        // Tên tạm riêng cho mỗi lần tải: 2 view cùng tải không ghi đè/xoá file của nhau
+        val tmp = File(dest.parentFile, "${dest.name}.${System.nanoTime()}.tmp")
+        try {
+            val conn = URL(spec.url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
             try {
-                db.addImage(name, bmp, physicalWidthMeters)
-                added++
-            } catch (e: ImageInsufficientQualityException) {
-                Log.w(TAG, "ARCore từ chối ảnh '$name': chất lượng feature quá thấp — bỏ qua")
-            } catch (e: Exception) {
-                Log.w(TAG, "addImage '$name' lỗi — bỏ qua", e)
-            }
-            bmp.recycle()
-            if (i % 10 == 9) listener?.onStatus("loading", "Đang xử lý ảnh nhận diện ${i + 1}/${images.size}…")
-        }
-        Log.i(TAG, "Dựng database: $added/${targets.size} ảnh dùng được")
-        if (added == 0) return null
-
-        try {
-            val tmp = File(cacheFile.parentFile, cacheFile.name + ".tmp")
-            FileOutputStream(tmp).use { db.serialize(it) }
-            cacheFile.parentFile?.listFiles { f -> f.name.startsWith("armobile_aug_") && f != tmp }?.forEach { it.delete() }
-            tmp.renameTo(cacheFile)
-        } catch (e: Exception) {
-            Log.w(TAG, "Không lưu được cache imgdb (không ảnh hưởng chức năng)", e)
-        }
-        return db
-    }
-
-    private fun downloadAll(targets: List<TargetSpec>, gen: Int): List<Pair<String, Bitmap>> {
-        val pool = Executors.newFixedThreadPool(4)
-        try {
-            val futures = targets.map { t ->
-                pool.submit(Callable<Pair<String, Bitmap>?> {
-                    if (gen != loadGeneration) null else loadTargetBitmap(t.url)?.let { t.name to it }
-                })
-            }
-            val out = ArrayList<Pair<String, Bitmap>>()
-            for ((i, f) in futures.withIndex()) {
-                val r = try { f.get() } catch (e: Exception) { null }
-                if (r != null) out.add(r)
-                if (i % 10 == 9) listener?.onStatus("loading", "Đang tải ảnh nhận diện ${i + 1}/${targets.size}…")
-            }
-            return out
-        } finally {
-            pool.shutdownNow()
-        }
-    }
-
-    /** Tải + giải mã + thu nhỏ ≤ MAX_TARGET_DIM + đè lên nền trắng (PNG trong suốt làm ARCore mất feature) */
-    private fun loadTargetBitmap(source: String): Bitmap? {
-        return try {
-            val bytes = when {
-                source.startsWith("http://") || source.startsWith("https://") -> {
-                    val conn = URL(source).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 15000
-                    conn.readTimeout = 30000
-                    conn.connect()
-                    conn.inputStream.use { it.readBytes() }
+                val code = conn.responseCode
+                if (code != HttpURLConnection.HTTP_OK) throw IOException("HTTP $code")
+                val md = MessageDigest.getInstance("SHA-256")
+                var total = 0L
+                conn.inputStream.use { input ->
+                    FileOutputStream(tmp).use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            md.update(buf, 0, n)
+                            out.write(buf, 0, n)
+                            total += n
+                        }
+                    }
                 }
-                source.startsWith("file://") -> File(source.removePrefix("file://")).readBytes()
-                else -> context.assets.open(source).use { it.readBytes() } // fallback debug: tên asset cục bộ
+                val sha = md.digest().joinToString("") { "%02x".format(it) }
+                if (!sha.equals(spec.sha256, ignoreCase = true)) {
+                    throw IOException("File tải về bị hỏng (sha256 không khớp, $total bytes)")
+                }
+            } finally {
+                conn.disconnect()
             }
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                Log.w(TAG, "Không đọc được kích thước ảnh '$source'")
-                return null
-            }
-            var sample = 1
-            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_TARGET_DIM) sample *= 2
-            val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
-                ?: return null
-            val k = MAX_TARGET_DIM.toFloat() / maxOf(raw.width, raw.height)
-            val w = if (k < 1f) maxOf(1, (raw.width * k).toInt()) else raw.width
-            val h = if (k < 1f) maxOf(1, (raw.height * k).toInt()) else raw.height
-            val flat = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(flat)
-            canvas.drawColor(Color.WHITE)
-            canvas.drawBitmap(Bitmap.createScaledBitmap(raw, w, h, true), 0f, 0f, null)
-            raw.recycle()
-            flat
-        } catch (e: Throwable) {
-            Log.e(TAG, "Không tải được ảnh trigger '$source'", e)
-            null
+            if (!tmp.renameTo(dest) && !dest.exists()) throw IOException("Không lưu được database vào cache")
+            // Chỉ giữ bản mới nhất (gồm cả cache armobile_aug_* của bản app cũ); không động vào file .tmp đang tải
+            dest.parentFile?.listFiles { f ->
+                f.name.startsWith("armobile_") && f.name.endsWith(".imgdb") && f != dest
+            }?.forEach { it.delete() }
+        } finally {
+            tmp.delete()
         }
     }
 

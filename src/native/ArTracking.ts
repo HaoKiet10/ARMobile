@@ -19,14 +19,12 @@ export interface ArStatusEvent {
 }
 
 interface ArCameraViewProps extends ViewProps {
-  /** JSON string mảng [{ name: projectId, url: triggerImageUrl }] — tất cả ảnh cần nhận diện */
-  targetsJson?: string;
+  /** JSON string { version, url, sha256 } — database nhận diện dựng sẵn trên server (GET /public/trigger-db) */
+  triggerDbJson?: string;
   /** JSON string { target: projectId, assets: [...] } — overlay của project đang active (buildOverlayConfigJson) */
   overlayJson?: string;
   /** Đổi số này để native dựng lại database + session (nút "Thử lại") */
   reloadToken?: number;
-  /** Chiều rộng "danh nghĩa" dùng để ước lượng pose, đơn vị mét */
-  physicalWidth?: number;
   /** Debug: bắn event pose mỗi frame (nặng bridge) */
   emitPose?: boolean;
 }

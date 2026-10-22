@@ -26,9 +26,13 @@ export interface PublicProject {
   triggerImageUrl: string | null;
   assets: ARAsset[];
 }
-// Khớp response của GET /public/projects (scan.controller.ts -> listPublishedTriggers)
-export interface PublishedTrigger {
-  id: string;
-  name: string;
-  triggerImageUrl: string | null;
+// Khớp response của GET /public/trigger-db (scan.controller.ts -> TriggerDbController)
+export interface TriggerDb {
+  version: string;
+  /** null khi chưa có project nào publish */
+  url: string | null;
+  sha256: string | null;
+  size: number;
+  /** Project có trong database (name trong database = project id) */
+  triggers: { id: string; name: string }[];
 }
