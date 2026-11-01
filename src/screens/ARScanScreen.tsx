@@ -7,7 +7,11 @@ import {
   TouchableOpacity,
   PermissionsAndroid,
   Platform,
+  AppState,
+  Linking,
+  Vibration,
 } from 'react-native';
+import ScanFrame from '../components/ScanFrame';
 import {
   ArCameraView,
   ArStatusEvent,
@@ -15,7 +19,8 @@ import {
   addAnchorRemovedListener,
   addStatusListener,
 } from '../native/ArTracking';
-import { fetchPublicProject, fetchTriggerDb } from '../services/api';
+import { API_BASE_URL } from '../config';
+import { ApiError, fetchPublicProject, fetchTriggerDb } from '../services/api';
 import { PublicProject, TriggerDb } from '../types/ar';
 import { buildOverlayConfigJson } from '../utils/arAssets';
 
@@ -24,7 +29,16 @@ import { buildOverlayConfigJson } from '../utils/arAssets';
 // chiều rộng này vào database nhận diện để ARCore ước lượng pose. Giữ khớp với editor/README.
 const NOMINAL_MARKER_WIDTH = 0.15;
 
+// Lỗi tạm thời (server đang thức dậy / đang dựng database, rớt mạng) thì tự thử lại vài lần trước khi báo lỗi
+const MAX_AUTO_RETRY = 4;
+const AUTO_RETRY_DELAY_MS = 4000;
+// Sau ngần này mà vẫn đang tải thì giải thích cho người dùng là server có thể đang khởi động
+const SLOW_HINT_DELAY_MS = 6000;
+
 type ListPhase = 'loading' | 'error' | 'empty' | 'ready';
+type CameraPermission = 'checking' | 'granted' | 'denied' | 'blocked';
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 interface ActiveProject {
   id: string;
@@ -36,8 +50,10 @@ interface ActiveProject {
  * publish, ARCore nhận diện ảnh nào thì tải project đó và hiện nội dung lên.
  */
 const ARScanScreen: React.FC = () => {
-  const [hasCameraPermission, setHasCameraPermission] = useState(false);
+  const [permission, setPermission] = useState<CameraPermission>('checking');
   const [phase, setPhase] = useState<ListPhase>('loading');
+  const [loadingMsg, setLoadingMsg] = useState('');
+  const [slowHint, setSlowHint] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [triggerDb, setTriggerDb] = useState<TriggerDb | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
@@ -49,43 +65,87 @@ const ARScanScreen: React.FC = () => {
   const trackedRef = useRef<Set<string>>(new Set());
   const activeIdRef = useRef<string | null>(null);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mỗi lần loadList tăng số này; vòng tải cũ thấy lệch số thì dừng (bấm "Thử lại" giữa chừng, unmount)
+  const loadSeq = useRef(0);
 
-  useEffect(() => {
-    (async () => {
-      if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
-          title: 'Cần quyền Camera',
-          message: 'App cần camera để nhận diện ảnh trigger',
-          buttonPositive: 'Đồng ý',
-        });
-        setHasCameraPermission(granted === PermissionsAndroid.RESULTS.GRANTED);
-      } else {
-        setHasCameraPermission(true);
-      }
-    })();
+  const requestCamera = useCallback(async () => {
+    if (Platform.OS !== 'android') {
+      setPermission('granted');
+      return;
+    }
+    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+      title: 'Cho phép dùng camera',
+      message: 'App cần camera để nhận diện ảnh và hiển thị nội dung AR.',
+      buttonPositive: 'Đồng ý',
+    });
+    if (result === PermissionsAndroid.RESULTS.GRANTED) setPermission('granted');
+    else if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) setPermission('blocked');
+    else setPermission('denied');
   }, []);
 
+  useEffect(() => {
+    requestCamera();
+  }, [requestCamera]);
+
+  // Người dùng bật quyền trong Cài đặt rồi quay lại app -> vào màn quét luôn, không bắt bấm gì thêm
+  useEffect(() => {
+    if (permission !== 'denied' && permission !== 'blocked') return;
+    const sub = AppState.addEventListener('change', async (state) => {
+      if (state === 'active' && (await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA))) {
+        setPermission('granted');
+      }
+    });
+    return () => sub.remove();
+  }, [permission]);
+
   const loadList = useCallback(async () => {
+    const seq = ++loadSeq.current;
     setPhase('loading');
+    setLoadingMsg('Đang kết nối máy chủ...');
+    setSlowHint(false);
     setActive(null);
     setContentError(null);
     activeIdRef.current = null;
     trackedRef.current.clear();
     setTrackedIds([]);
     setArStatus({ state: 'loading' });
+    const slowTimer = setTimeout(() => {
+      if (loadSeq.current === seq) setSlowHint(true);
+    }, SLOW_HINT_DELAY_MS);
     try {
-      const db = await fetchTriggerDb();
-      setTriggerDb(db);
-      setPhase(db.url && db.triggers.length > 0 ? 'ready' : 'empty');
-    } catch (err: any) {
-      setErrorMsg(err?.message ?? 'Không tải được danh sách project');
-      setPhase('error');
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const db = await fetchTriggerDb();
+          if (loadSeq.current !== seq) return;
+          setTriggerDb(db);
+          setPhase(db.url && db.triggers.length > 0 ? 'ready' : 'empty');
+          return;
+        } catch (err: any) {
+          if (loadSeq.current !== seq) return;
+          if (err instanceof ApiError && err.retryable && attempt < MAX_AUTO_RETRY) {
+            setLoadingMsg(err.message);
+            await sleep(AUTO_RETRY_DELAY_MS);
+            if (loadSeq.current !== seq) return;
+            continue;
+          }
+          setErrorMsg(err?.message ?? 'Không tải được dữ liệu. Vui lòng thử lại.');
+          setPhase('error');
+          return;
+        }
+      }
+    } finally {
+      clearTimeout(slowTimer);
     }
+  }, []);
+
+  const cancelLoad = useCallback(() => {
+    loadSeq.current++; // vòng tải đang chạy thấy lệch số -> dừng
   }, []);
 
   useEffect(() => {
     loadList();
-  }, [loadList]);
+    return cancelLoad;
+  }, [loadList, cancelLoad]);
 
   const activate = useCallback(async (id: string) => {
     activeIdRef.current = id;
@@ -94,10 +154,11 @@ const ARScanScreen: React.FC = () => {
       const project = await fetchPublicProject(id);
       if (activeIdRef.current !== id) return; // đã chuyển sang project khác trong lúc tải
       setActive({ id, project });
+      Vibration.vibrate(40); // rung nhẹ báo đã nhận diện
     } catch (err: any) {
       if (activeIdRef.current !== id) return;
       activeIdRef.current = null;
-      setContentError(err?.message ?? 'Không tải được nội dung');
+      setContentError(err?.message ?? 'Không tải được nội dung. Đang thử lại...');
       // Thử lại 1 lần sau 2.5s nếu ảnh vẫn đang được nhìn thấy
       if (retryTimer.current) clearTimeout(retryTimer.current);
       retryTimer.current = setTimeout(() => {
@@ -153,10 +214,23 @@ const ARScanScreen: React.FC = () => {
     loadList();
   };
 
-  if (!hasCameraPermission) {
+  if (permission === 'checking') {
+    return <View style={styles.center} />;
+  }
+
+  if (permission !== 'granted') {
+    const blocked = permission === 'blocked';
     return (
       <View style={styles.center}>
-        <Text style={styles.text}>Đang chờ quyền camera...</Text>
+        <Text style={styles.title}>Cần quyền camera</Text>
+        <Text style={styles.errorText}>
+          {blocked
+            ? 'Bạn đã tắt quyền camera cho app. Hãy bật lại trong Cài đặt để quét ảnh.'
+            : 'App cần camera để nhận diện ảnh và hiển thị nội dung AR.'}
+        </Text>
+        <TouchableOpacity style={styles.button} onPress={blocked ? () => Linking.openSettings() : requestCamera}>
+          <Text style={styles.buttonText}>{blocked ? 'Mở Cài đặt' : 'Cấp quyền'}</Text>
+        </TouchableOpacity>
       </View>
     );
   }
@@ -165,7 +239,10 @@ const ARScanScreen: React.FC = () => {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="large" color="#ffffff" />
-        <Text style={styles.text}>Đang tải danh sách project...</Text>
+        <Text style={styles.text}>{loadingMsg}</Text>
+        {slowHint && (
+          <Text style={styles.hint}>Lần mở đầu tiên máy chủ có thể cần tới 1 phút để khởi động.</Text>
+        )}
       </View>
     );
   }
@@ -173,10 +250,13 @@ const ARScanScreen: React.FC = () => {
   if (phase === 'error') {
     return (
       <View style={styles.center}>
+        <Text style={styles.title}>Không tải được dữ liệu</Text>
         <Text style={styles.errorText}>{errorMsg}</Text>
         <TouchableOpacity style={styles.button} onPress={retryAll}>
           <Text style={styles.buttonText}>Thử lại</Text>
         </TouchableOpacity>
+        {/* Chỉ bản debug: biết ngay app đang gọi backend nào (API_URL trong .env) */}
+        {__DEV__ && <Text style={styles.devInfo}>Backend: {API_BASE_URL}</Text>}
       </View>
     );
   }
@@ -184,7 +264,8 @@ const ARScanScreen: React.FC = () => {
   if (phase === 'empty') {
     return (
       <View style={styles.center}>
-        <Text style={styles.errorText}>Chưa có project nào được publish.</Text>
+        <Text style={styles.title}>Chưa có nội dung AR</Text>
+        <Text style={styles.errorText}>Hiện chưa có ảnh nào để quét. Hãy quay lại sau nhé.</Text>
         <TouchableOpacity style={styles.button} onPress={retryAll}>
           <Text style={styles.buttonText}>Tải lại</Text>
         </TouchableOpacity>
@@ -206,15 +287,16 @@ const ARScanScreen: React.FC = () => {
 
       {arStatus.state === 'ready' && !anyTracked && (
         <View style={styles.overlay} pointerEvents="none">
-          <View style={styles.scanFrame} />
-          <Text style={styles.overlayText}>Đưa camera vào ảnh trigger để bắt đầu</Text>
+          <ScanFrame />
+          <Text style={styles.overlayText}>Hướng camera vào ảnh để xem nội dung AR</Text>
         </View>
       )}
 
       {arStatus.state === 'ready' && anyTracked && (
-        <View style={styles.badge} pointerEvents="none">
-          <Text style={styles.badgeText}>
-            {activeTracked ? `Đã nhận diện: ${active!.project.name}` : 'Đang tải nội dung...'}
+        <View style={[styles.badge, !activeTracked && styles.badgeLoading]} pointerEvents="none">
+          {!activeTracked && <ActivityIndicator size="small" color="#ffffff" style={styles.badgeSpinner} />}
+          <Text style={styles.badgeText} numberOfLines={1}>
+            {activeTracked ? active!.project.name : 'Đang tải nội dung...'}
           </Text>
         </View>
       )}
@@ -258,8 +340,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
+  title: { color: '#fff', fontSize: 20, fontWeight: '700', textAlign: 'center', marginBottom: 8 },
   text: { color: '#fff', marginTop: 12, fontSize: 16, textAlign: 'center' },
-  errorText: { color: '#fff', fontSize: 16, textAlign: 'center', marginBottom: 16 },
+  hint: { color: 'rgba(255,255,255,0.6)', marginTop: 8, fontSize: 14, textAlign: 'center', maxWidth: 280 },
+  devInfo: { color: 'rgba(255,255,255,0.45)', marginTop: 24, fontSize: 12, textAlign: 'center' },
+  errorText: { color: 'rgba(255,255,255,0.85)', fontSize: 16, textAlign: 'center', marginBottom: 20, maxWidth: 300 },
   button: { backgroundColor: '#2f6fed', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
   buttonText: { color: '#fff', fontWeight: '600' },
   overlay: {
@@ -271,15 +356,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  scanFrame: {
-    width: 240,
-    height: 240,
-    borderWidth: 2,
-    borderColor: 'rgba(255,255,255,0.8)',
-    borderRadius: 16,
-  },
   overlayText: {
-    marginTop: 16,
+    marginTop: 24,
     color: '#fff',
     fontSize: 15,
     textAlign: 'center',
@@ -293,11 +371,16 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 60,
     alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    maxWidth: '85%',
     backgroundColor: 'rgba(40,180,99,0.9)',
     paddingHorizontal: 16,
     paddingVertical: 8,
     borderRadius: 20,
   },
+  badgeLoading: { backgroundColor: 'rgba(0,0,0,0.6)' },
+  badgeSpinner: { marginRight: 8 },
   badgeError: { top: 110, backgroundColor: 'rgba(200,60,60,0.9)' },
   badgeText: { color: '#fff', fontWeight: '600' },
 });

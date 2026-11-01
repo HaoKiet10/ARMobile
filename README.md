@@ -1,97 +1,67 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# ARMobile
 
-# Getting Started
+App quét AR cho end-user — React Native 0.86 (Android) + native module ARCore tự viết (`android/app/src/main/java/com/armobile/artracking/`). Đưa camera vào ảnh trigger của project đã publish trên web designer tool là nội dung AR (model `.glb`, ảnh, video) hiện lên.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+Backend, web và tài liệu kiến trúc nằm ở repo chính [`Augmented-Reality`](https://github.com/HaoKiet10/Augmented-Reality) (xem README + thư mục `wiki/`).
 
-## Step 1: Start Metro
+Tài liệu chi tiết của app nằm trong [`wiki/`](wiki/Index.md) (mở bằng Obsidian để xem graph).
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Yêu cầu
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+- Node >= 22.11
+- **pnpm** (ghim qua `packageManager` trong `package.json`) — không dùng npm/yarn
+- JDK 17, Android SDK
+- Máy Android hỗ trợ ARCore
 
-```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
-```
-
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
+## Chạy
 
 ```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+pnpm install
+pnpm start                 # Metro
+# cửa sổ khác:
+adb reverse tcp:8081 tcp:8081
+pnpm android
 ```
-
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
 
 ```sh
-bundle install
+pnpm lint
+pnpm test
 ```
 
-Then, and every time you update your native dependencies, run:
+## Chọn backend (`.env`)
+
+App gọi backend production mặc định. Muốn trỏ sang backend khác (vd backend local đang dev):
 
 ```sh
-bundle exec pod install
+cp .env.example .env       # rồi bỏ comment 1 dòng API_URL
+pnpm start --reset-cache   # BẮT BUỘC sau mỗi lần đổi .env (giá trị được nhúng lúc bundle)
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+| Trường hợp | `API_URL` | Thêm |
+|---|---|---|
+| Production (mặc định) | bỏ trống / không có `.env` | |
+| Backend local, điện thoại cắm USB | `http://localhost:3000` | `adb reverse tcp:3000 tcp:3000` |
+| Backend local qua Wi-Fi | `http://<IP LAN của máy>:3000` | cùng mạng; mở cổng 3000 trên Windows Firewall |
 
-```sh
-# Using npm
-npm run ios
+- `.env` không được commit (đã có trong `.gitignore`); mẫu ở `.env.example`.
+- `http://` chỉ chạy ở bản **debug** (Android chặn cleartext ở bản release) — bản release luôn dùng `https://`.
+- Bản debug hiện URL backend đang dùng ở màn lỗi "Không tải được dữ liệu".
+- Có thể đặt qua biến môi trường thay cho file, vd CI: `API_URL=https://... pnpm android`.
+- Code: `src/config.ts` (`API_BASE_URL`), cấu hình plugin ở `babel.config.js`.
 
-# OR using Yarn
-yarn ios
-```
+## Lưu ý về pnpm
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+React Native cần `node_modules` dạng phẳng: `pnpm-workspace.yaml` đặt `nodeLinker: hoisted`. Đừng xoá dòng này — layout mặc định (isolated) làm ESLint không tìm thấy plugin và dễ vỡ autolinking.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+## Cấu trúc
 
-## Step 3: Modify your app
+| Đường dẫn | Nội dung |
+|---|---|
+| `src/screens/ARScanScreen.tsx` | Màn quét: quyền camera, tải database nhận diện, chọn project đang nhìn thấy |
+| `src/config.ts` | `API_BASE_URL` — backend app gọi tới (`API_URL` trong `.env`) |
+| `src/services/api.ts` | Gọi backend (`/public/trigger-db`, `/public/projects/:id`) |
+| `src/utils/arAssets.ts` | Đổi toạ độ editor sang toạ độ marker ARCore |
+| `src/native/ArTracking.ts` | Binding JS cho `ArCameraView` native |
+| `android/.../artracking/` | ARCore session, render overlay, `.glb` |
 
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+Các lỗi hay gặp khi setup máy mới: xem mục "Setup máy mới" trong README repo chính.
