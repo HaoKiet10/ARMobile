@@ -3,8 +3,7 @@ import { StyleSheet, StatusBar } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import ARScanScreen from './src/screens/ARScanScreen';
 
-// Không còn màn nhập Project ID: app tự nhận diện project qua ảnh trigger.
-// (ProjectIdEntryScreen.tsx không còn được dùng — có thể xoá hoặc giữ lại làm công cụ debug.)
+// Không có màn nhập Project ID: app tự nhận diện project qua ảnh trigger.
 const App: React.FC = () => {
   return (
     <SafeAreaProvider>

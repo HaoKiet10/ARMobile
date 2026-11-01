@@ -1,0 +1,3 @@
+# pnpm >= 10 đọc setting ở đây, KHÔNG còn đọc node-linker trong .npmrc (giữ .npmrc cho pnpm cũ).
+# React Native (Metro, Gradle autolinking, ESLint 8 resolve plugin) cần node_modules dạng phẳng.
+nodeLinker: hoisted
